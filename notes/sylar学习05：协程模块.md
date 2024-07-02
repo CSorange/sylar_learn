@@ -234,7 +234,7 @@ void Fiber::reset(std::function<void()> cb) {
 }
 ```
 
-resume(切换到当前进程)
+resume(切换到当前协程)
 
 ```c++
 void Fiber::resume() {

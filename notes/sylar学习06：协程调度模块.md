@@ -343,3 +343,280 @@ bool Scheduler::stopping() {
 }
 ```
 
+
+
+下面来补充一下这部分关于主函数的学习。
+
+```c++
+sylar::Scheduler sc;
+```
+
+首先就是初始化协程调度器。
+
+```c++
+Scheduler::Scheduler(size_t threads, bool use_caller, const std::string &name) {
+    SYLAR_ASSERT(threads > 0);// 确定线程数量要正确
+
+    m_useCaller = use_caller; 
+    m_name      = name;
+
+    if (use_caller) {// 是否将协程调度线程也纳入调度器
+        --threads;
+        sylar::Fiber::GetThis();// 获得主协程,这里没有，所以要重新生成。
+        SYLAR_ASSERT(GetThis() == nullptr);
+        t_scheduler = this; // 设置当前协程调度器
+
+        /**
+         * caller线程的主协程不会被线程的调度协程run进行调度，而且，线程的调度协程停止时，应该返回caller线程的主协程
+         * 在user caller情况下，把caller线程的主协程暂时保存起来，等调度协程结束时，再resume caller协程
+         */
+        m_rootFiber.reset(new Fiber(std::bind(&Scheduler::run, this), 0, false));
+        sylar::Thread::SetName(m_name);
+        //设置当前线程的主协程为m_rootFiber，这里的m_rootFiber是该线程的主协程（执行run任务的协程），只有默认构造出来的fiber才是主协程
+        t_scheduler_fiber = m_rootFiber.get();
+        m_rootThread      = sylar::GetThreadId();// 获得当前线程id
+        m_threadIds.push_back(m_rootThread);
+    } else {// 不将当前线程纳入调度器
+        m_rootThread = -1;
+    }
+    m_threadCount = threads;
+}
+```
+
+调度器里的内容都比较中规中矩，大概是不涉及到多线程的缘故。很多操作都是为了修改静态变量，例如`SetName`函数内的操作。
+
+有一个问题就是，我们一开始生成了一个默认主协程，然后再后面又生成了一个子协程，然后用智能指针t_scheduler_fiber指向子协程，后面将t_scheduler_fiber设置为这个子协程，即前线程的调度协程。那么现在的主协程是哪一个呢，应该还是上面那个默认主协程吧。
+
+另外主协程ID为0x555555663e40，子协程为0x555555664290。
+
+之后我们往sc中添加调度任务。
+
+```c++
+// 添加调度任务，使用函数作为调度对象
+sc.schedule(test_fiber1);
+sc.schedule(test_fiber2);
+
+// 添加调度任务，使用Fiber类作为调度对象
+sylar::Fiber::ptr fiber(new sylar::Fiber(&test_fiber3));
+sc.schedule(fiber);
+```
+
+schedule函数：
+
+```c++
+template <class FiberOrCb>
+    void schedule(FiberOrCb fc, int thread = -1) {
+        bool need_tickle = false;
+        {
+            MutexType::Lock lock(m_mutex);
+            need_tickle = scheduleNoLock(fc, thread);
+        }
+
+        if (need_tickle) {
+            tickle(); // 唤醒idle协程（进行输出打印）
+        }
+    }
+template <class FiberOrCb>
+    bool scheduleNoLock(FiberOrCb fc, int thread) {
+        bool need_tickle = m_tasks.empty();
+        ScheduleTask task(fc, thread);
+        if (task.fiber || task.cb) {
+            m_tasks.push_back(task);
+        }
+        return need_tickle;
+    }
+```
+
+这个其实也没什么，主要是添加到m_tasks。有一个关于锁使用的地方还挺有趣的，就是在加锁，然后执行完scheduleNoLock函数并返回后，会自动执行~ScopedLockImpl()，将锁下掉。自己之前也很疑问说只有加锁函数，没有解锁函数。
+
+之后开始任务调度。
+
+```c++
+sc.start();
+
+void Scheduler::start() {
+    SYLAR_LOG_DEBUG(g_logger) << "start";
+    MutexType::Lock lock(m_mutex);
+    if (m_stopping) {// 已经启动了
+        SYLAR_LOG_ERROR(g_logger) << "Scheduler is stopped";
+        return;
+    }
+    SYLAR_ASSERT(m_threads.empty());
+    m_threads.resize(m_threadCount);
+    for (size_t i = 0; i < m_threadCount; i++) {
+        m_threads[i].reset(new Thread(std::bind(&Scheduler::run, this),
+                                      m_name + "_" + std::to_string(i)));// 线程执行 run() 任务
+        m_threadIds.push_back(m_threads[i]->getId());
+    }
+}
+```
+
+感觉很奇怪，因为把协程调度线程也纳入调度器，所以此时线程数m_threadCount=0，所以这里基本上没有做什么。
+
+然后就是又添加调度任务：`sc.schedule(test_fiber4);`
+
+然后就停止了hh。
+
+```c++
+sc.stop();
+void Scheduler::stop() {
+    SYLAR_LOG_DEBUG(g_logger) << "stop";
+    if (stopping()) {
+        return;
+    }
+    m_stopping = true;// 进入stop将自动停止设为true
+
+    /// 如果use caller，那只能由caller线程发起stop
+    if (m_useCaller) {
+        SYLAR_ASSERT(GetThis() == this);
+    } else {
+        SYLAR_ASSERT(GetThis() != this);
+    }
+
+    for (size_t i = 0; i < m_threadCount; i++) {// 每个线程都tickle一下
+        tickle();
+    }
+
+    if (m_rootFiber) {// 使用use_caller多tickle一下
+        tickle();
+    }
+
+    /// 在use caller情况下，调度器协程结束时，应该返回caller协程
+    if (m_rootFiber) {
+        m_rootFiber->resume();
+        SYLAR_LOG_DEBUG(g_logger) << "m_rootFiber end";
+    }
+
+    std::vector<Thread::ptr> thrs;
+    {
+        MutexType::Lock lock(m_mutex);
+        thrs.swap(m_threads);
+    }
+    for (auto &i : thrs) {// 等待线程执行完成
+        i->join();
+    }
+}
+```
+
+前面都还好，后面就是我们在在use caller情况下运行`m_rootFiber->resume()`。
+
+```c++
+void Fiber::resume() {
+    SYLAR_ASSERT(m_state != TERM && m_state != RUNNING);
+    SetThis(this);
+    m_state = RUNNING;
+
+    // 如果协程参与调度器调度，那么应该和调度器的主协程进行swap，而不是线程主协程
+    if (m_runInScheduler) {
+        if (swapcontext(&(Scheduler::GetMainFiber()->m_ctx), &m_ctx)) {
+            SYLAR_ASSERT2(false, "swapcontext");
+        }
+    } else {
+        if (swapcontext(&(t_thread_fiber->m_ctx), &m_ctx)) {
+            SYLAR_ASSERT2(false, "swapcontext");
+        }
+    }
+}
+```
+
+不过这里m_runInScheduler=false，所以还是进行下面那个(m_runInScheduler的值会传入，所以是外部决定的)。
+
+之后又来到了MainFunc函数。同样从`cur->m_cb();`进入了回调函数，即`run`函数，这是在Scheduler构造函数中生成m_rootFiber就决定了的。
+
+```c++
+void Scheduler::run() {
+    SYLAR_LOG_DEBUG(g_logger) << "run";
+    set_hook_enable(true);
+    setThis();
+    if (sylar::GetThreadId() != m_rootThread) {// 非user_caller线程，设置主协程为线程主协程
+        t_scheduler_fiber = sylar::Fiber::GetThis().get();
+    }
+    // 定义dile_fiber，当任务队列中的任务执行完之后，执行idle()
+    Fiber::ptr idle_fiber(new Fiber(std::bind(&Scheduler::idle, this)));
+    Fiber::ptr cb_fiber;
+
+    ScheduleTask task;
+    while (true) {
+        task.reset();
+        bool tickle_me = false; // 是否tickle其他线程进行任务调度
+        {// 从任务队列中拿fiber和cb
+            MutexType::Lock lock(m_mutex);
+            auto it = m_tasks.begin();
+            // 遍历所有调度任务
+            while (it != m_tasks.end()) {// 如果当前任务指定的线程不是当前线程，则跳过，并且tickle一下
+                if (it->thread != -1 && it->thread != sylar::GetThreadId()) {
+                    // 指定了调度线程，但不是在当前线程上调度，标记一下需要通知其他线程进行调度，然后跳过这个任务，继续下一个
+                    ++it;
+                    tickle_me = true;
+                    continue;
+                }
+
+                // 找到一个未指定线程，或是指定了当前线程的任务
+                SYLAR_ASSERT(it->fiber || it->cb);
+
+                // if (it->fiber) {
+                //     // 任务队列时的协程一定是READY状态，谁会把RUNNING或TERM状态的协程加入调度呢？
+                //     SYLAR_ASSERT(it->fiber->getState() == Fiber::READY);
+                // }
+
+                // [BUG FIX]: hook IO相关的系统调用时，在检测到IO未就绪的情况下，会先添加对应的读写事件，再yield当前协程，等IO就绪后再resume当前协程
+                // 多线程高并发情境下，有可能发生刚添加事件就被触发的情况，如果此时当前协程还未来得及yield，则这里就有可能出现协程状态仍为RUNNING的情况
+                // 这里简单地跳过这种情况，以损失一点性能为代价，否则整个协程框架都要大改
+                if(it->fiber && it->fiber->getState() == Fiber::RUNNING) {
+                    ++it;
+                    continue;
+                }
+                
+                // 当前调度线程找到一个任务，准备开始调度，将其从任务队列中剔除，活动线程数加1
+                task = *it;
+                m_tasks.erase(it++);
+                ++m_activeThreadCount;
+                break;
+            }
+            // 当前线程拿完一个任务后，发现任务队列还有剩余，那么tickle一下其他线程
+            tickle_me |= (it != m_tasks.end());
+        }
+
+        if (tickle_me) {
+            tickle();
+        }
+
+        if (task.fiber) {
+            // resume协程，resume返回时，协程要么执行完了，要么半路yield了，总之这个任务就算完成了，活跃线程数减一
+            task.fiber->resume();
+            --m_activeThreadCount;
+            task.reset();
+        } else if (task.cb) {
+            if (cb_fiber) {
+                cb_fiber->reset(task.cb);
+            } else {
+                cb_fiber.reset(new Fiber(task.cb));//相当于调度的是回调函数，也当作协程处理。
+            }
+            task.reset();
+            cb_fiber->resume();
+            --m_activeThreadCount;
+            cb_fiber.reset();
+        } else {
+            // 进到这个分支情况一定是任务队列空了，调度idle协程即可
+            if (idle_fiber->getState() == Fiber::TERM) {
+                // 如果调度器没有调度任务，那么idle协程会不停地resume/yield，不会结束，如果idle协程结束了，那一定是调度器停止了
+                SYLAR_LOG_DEBUG(g_logger) << "idle fiber term";
+                break;
+            }
+            ++m_idleThreadCount;
+            idle_fiber->resume();
+            --m_idleThreadCount;
+        }
+    }
+    SYLAR_LOG_DEBUG(g_logger) << "Scheduler::run() exit";
+}
+```
+
+run函数还是很大的，上面其实没有做什么，但是run函数里做的事情还挺多的。首先查看每一个任务，这里任务其实是有两种，一种是回调函数，一种是一个协程，这里处理回调函数时，也生成一个协程，然后用resume函数运行这个协程。后面就和我们运行每一个协程是一样的了。可能这里不存在多线程的情况，所以很多时候处理起来都很简单，感觉就像是平铺直叙的运行一样，没有感觉出调度。
+
+
+
+另外这个文件运行起来是有bug的，在处理第二个任务时，进入sleep函数之后出现了bug。感觉以目前的能力调试不好，就先放弃了。
+
+
+

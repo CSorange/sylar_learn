@@ -420,6 +420,283 @@ bool IOManager::cancelAll(int fd) {
 
 cancelEvent(取消事件)
 
+取消事件会出发该事件。
+
+```c++
+bool IOManager::cancelEvent(int fd, Event event) {
+    // 找到fd对应的FdContext
+    RWMutexType::ReadLock lock(m_mutex);
+    if ((int)m_fdContexts.size() <= fd) {
+        return false;
+    }
+    FdContext *fd_ctx = m_fdContexts[fd];
+    lock.unlock();
+
+    FdContext::MutexType::Lock lock2(fd_ctx->mutex);
+    if (SYLAR_UNLIKELY(!(fd_ctx->events & event))) {
+        return false;
+    }
+
+    // 删除事件
+    Event new_events = (Event)(fd_ctx->events & ~event);
+    int op           = new_events ? EPOLL_CTL_MOD : EPOLL_CTL_DEL;
+    epoll_event epevent;
+    epevent.events   = EPOLLET | new_events;
+    epevent.data.ptr = fd_ctx;
+
+    int rt = epoll_ctl(m_epfd, op, fd, &epevent);
+    if (rt) {
+        SYLAR_LOG_ERROR(g_logger) << "epoll_ctl(" << m_epfd << ", "
+                                  << (EpollCtlOp)op << ", " << fd << ", " << (EPOLL_EVENTS)epevent.events << "):"
+                                  << rt << " (" << errno << ") (" << strerror(errno) << ")";
+        return false;
+    }
+
+    // 删除之前触发一次事件
+    fd_ctx->triggerEvent(event);
+    // 活跃事件数减1
+    --m_pendingEventCount;
+    return true;
+}
+```
+
+cancelAll（取消所有事件）
+
+取消事件会触发该事件
+
+```c++
+bool IOManager::cancelAll(int fd) {
+    // 找到fd对应的FdContext
+    RWMutexType::ReadLock lock(m_mutex);
+    if ((int)m_fdContexts.size() <= fd) {
+        return false;
+    }
+    FdContext *fd_ctx = m_fdContexts[fd];// 拿到 fd 对应的 FdContext
+    lock.unlock();
+
+    FdContext::MutexType::Lock lock2(fd_ctx->mutex);
+    if (!fd_ctx->events) {// 若没有要删除的事件
+        return false;
+    }
+
+    // 删除全部事件
+    int op = EPOLL_CTL_DEL;
+    epoll_event epevent;
+    epevent.events   = 0;// 没有事件
+    epevent.data.ptr = fd_ctx;// ptr 关联 fd_ctx
+    // 注册事件
+    int rt = epoll_ctl(m_epfd, op, fd, &epevent);
+    if (rt) {
+        SYLAR_LOG_ERROR(g_logger) << "epoll_ctl(" << m_epfd << ", "
+                                  << (EpollCtlOp)op << ", " << fd << ", " << (EPOLL_EVENTS)epevent.events << "):"
+                                  << rt << " (" << errno << ") (" << strerror(errno) << ")";
+        return false;
+    }
+
+    // 触发全部已注册的事件
+    if (fd_ctx->events & READ) {// 有读事件执行读事件
+        fd_ctx->triggerEvent(READ);
+        --m_pendingEventCount;
+    }
+    if (fd_ctx->events & WRITE) {// 有写事件执行写事件
+        fd_ctx->triggerEvent(WRITE);
+        --m_pendingEventCount;
+    }
+
+    SYLAR_ASSERT(fd_ctx->events == 0);
+    return true;
+}
+```
+
+上面两个取消事件还是自己不是很明白，感觉差别不是很大mmm。
+
+triggerEvent(触发事件)
+
+根据事件类型调用对应上下文结构中的调度器去调度回调协程或回调函数。
+
+```c++
+void IOManager::FdContext::triggerEvent(IOManager::Event event) {
+    // 待触发的事件必须已被注册过
+    SYLAR_ASSERT(events & event);
+    /**
+     *  清除该事件，表示不再关注该事件了
+     * 也就是说，注册的IO事件是一次性的，如果想持续关注某个socket fd的读写事件，那么每次触发事件之后都要重新添加
+     */
+    events = (Event)(events & ~event);
+    // 调度对应的协程
+    EventContext &ctx = getEventContext(event);
+    if (ctx.cb) {
+        ctx.scheduler->schedule(ctx.cb);
+    } else {
+        ctx.scheduler->schedule(ctx.fiber);
+    }
+    resetEventContext(ctx);
+    return;
+}
+```
+
+GetThis(获得当前IO调度器)
+
+```c++
+IOManager *IOManager::GetThis() {
+    return dynamic_cast<IOManager *>(Scheduler::GetThis());
+}
+```
+
+tickle(通知调度器有任务要调度)
+
+写pipe让idle协程从epoll_wait退出，待idle协程yield之后Scheduler::run就可以调度其他任务。
+
+```c++
+void IOManager::tickle() {
+    SYLAR_LOG_DEBUG(g_logger) << "tickle";
+    if(!hasIdleThreads()) {//需要有空闲线程才可以继续进行
+        return;
+    }
+    int rt = write(m_tickleFds[1], "T", 1);
+    SYLAR_ASSERT(rt == 1);
+}
+```
+
+stopping（停止条件）
+
+```c++
+bool IOManager::stopping() {
+    uint64_t timeout = 0;
+    return stopping(timeout);
+}
+bool IOManager::stopping(uint64_t &timeout) {
+    // 对于IOManager而言，必须等所有待调度的IO事件都执行完了才可以退出
+    // 增加定时器功能后，还应该保证没有剩余的定时器待触发
+    timeout = getNextTimer();
+    // 定时器为空 && 等待执行的事件数量为0 && scheduler可以stop
+    return timeout == ~0ull && m_pendingEventCount == 0 && Scheduler::stopping();
+}
+```
+
+idle(idle协程)
+
+对于IO协程调度来说，应阻塞在等待IO事件上，idle退出的时机是epoll_wait返回，对应的操作是tickle或注册的IO事件发生。
+
+```c++
+void IOManager::idle() {
+    SYLAR_LOG_DEBUG(g_logger) << "idle";
+
+    // 一次epoll_wait最多检测256个就绪事件，如果就绪事件超过了这个数，那么会在下轮epoll_wati继续处理
+    const uint64_t MAX_EVNETS = 256;
+    epoll_event *events       = new epoll_event[MAX_EVNETS]();
+    std::shared_ptr<epoll_event> shared_events(events, [](epoll_event *ptr) {// 使用智能指针托管events， 离开idle自动释放
+        delete[] ptr;
+    });
+
+    while (true) {
+        // 获取下一个定时器的超时时间，顺便判断调度器是否停止
+        uint64_t next_timeout = 0;
+        if( SYLAR_UNLIKELY(stopping(next_timeout))) {
+            SYLAR_LOG_DEBUG(g_logger) << "name=" << getName() << "idle stopping exit";
+            break;
+        }
+
+        // 阻塞在epoll_wait上，等待事件发生或定时器超时
+        int rt = 0;
+        do{
+            // 默认超时时间5秒，如果下一个定时器的超时时间大于5秒，仍以5秒来计算超时，避免定时器超时时间太大时，epoll_wait一直阻塞
+            static const int MAX_TIMEOUT = 5000;
+            if(next_timeout != ~0ull) {
+                next_timeout = std::min((int)next_timeout, MAX_TIMEOUT);
+            } else {
+                next_timeout = MAX_TIMEOUT;
+            }//阻塞在这里
+            rt = epoll_wait(m_epfd, events, MAX_EVNETS, (int)next_timeout);
+            if(rt < 0 && errno == EINTR) {//这里就是源码 ep_poll() 中由操作系统中断返回的 EINTR，需要重新尝试 epoll_Wait
+                continue;
+            } else {
+                break;
+            }
+        } while(true);
+
+        // 收集所有已超时的定时器，执行回调函数
+        std::vector<std::function<void()>> cbs;
+        listExpiredCb(cbs);
+        if(!cbs.empty()) {
+            for(const auto &cb : cbs) {
+                schedule(cb);// 全部放到任务队列中
+            }
+            cbs.clear();
+        }
+        
+        // 遍历所有发生的事件，根据epoll_event的私有指针找到对应的FdContext，进行事件处理
+        for (int i = 0; i < rt; ++i) {
+            epoll_event &event = events[i];
+            if (event.data.fd == m_tickleFds[0]) {// 如果获得的这个信息时来自 pipe
+                // ticklefd[0]用于通知协程调度，这时只需要把管道里的内容读完即可
+                uint8_t dummy[256];
+                while (read(m_tickleFds[0], dummy, sizeof(dummy)) > 0)// 将 pipe 发来的1个字节数据读掉
+                    ;
+                continue;
+            }
+
+            FdContext *fd_ctx = (FdContext *)event.data.ptr;
+            FdContext::MutexType::Lock lock(fd_ctx->mutex);
+            /**
+             * EPOLLERR: 出错，比如写读端已经关闭的pipe
+             * EPOLLHUP: 套接字对端关闭
+             * 出现这两种事件，应该同时触发fd的读和写事件，否则有可能出现注册的事件永远执行不到的情况
+             */ 
+            if (event.events & (EPOLLERR | EPOLLHUP)) {
+                event.events |= (EPOLLIN | EPOLLOUT) & fd_ctx->events;
+            }
+            int real_events = NONE;
+            if (event.events & EPOLLIN) {// 读事件好了
+                real_events |= READ;
+            }
+            if (event.events & EPOLLOUT) {// 写事件好了
+                real_events |= WRITE;
+            }
+
+            if ((fd_ctx->events & real_events) == NONE) {// 没事件
+                continue;
+            }
+
+            // 剔除已经发生的事件，将剩下的事件重新加入epoll_wait
+            int left_events = (fd_ctx->events & ~real_events);
+            int op          = left_events ? EPOLL_CTL_MOD : EPOLL_CTL_DEL;// 如果执行完该事件还有事件则修改，若无事件则删除
+            event.events    = EPOLLET | left_events;// 更新新的事件
+
+            int rt2 = epoll_ctl(m_epfd, op, fd_ctx->fd, &event);// 重新注册事件
+            if (rt2) {
+                SYLAR_LOG_ERROR(g_logger) << "epoll_ctl(" << m_epfd << ", "
+                                          << (EpollCtlOp)op << ", " << fd_ctx->fd << ", " << (EPOLL_EVENTS)event.events << "):"
+                                          << rt2 << " (" << errno << ") (" << strerror(errno) << ")";
+                continue;
+            }
+
+            // 处理已经发生的事件，也就是让调度器调度指定的函数或协程
+            if (real_events & READ) {// 读事件好了，执行读事件
+                fd_ctx->triggerEvent(READ);
+                --m_pendingEventCount;
+            }
+            if (real_events & WRITE) {// 写事件好了，执行写事件
+                fd_ctx->triggerEvent(WRITE);
+                --m_pendingEventCount;
+            }
+        } // end for
+
+        /**
+         * 一旦处理完所有的事件，idle协程yield，这样可以让调度协程(Scheduler::run)重新检查是否有新任务要调度
+         * 上面triggerEvent实际也只是把对应的fiber重新加入调度，要执行的话还要等idle协程退出
+         */ 
+        Fiber::ptr cur = Fiber::GetThis();// 获得当前协程
+        auto raw_ptr   = cur.get();// 获得裸指针
+        cur.reset();
+
+        raw_ptr->yield();// 执行完返回scheduler的MainFiber 继续下一轮
+    } // end while(true)
+}
+```
+
+
+
 
 
 关于epoll
@@ -503,3 +780,155 @@ int epoll_wait(int epfd, struct epoll_event * events, int maxevents, int timeout
 ```
 
 收集在 `epoll`监控的事件中已经发生的事件，如果`epoll`中没有任何一个事件发生，则最多等待`timeout`毫秒后返回。`epoll_wait`的返回值表示当前发生的事件个数，如果返回 0，则表示本次调用中没有事件发生，如果返回 -1，则表示发生错误，需要检查`errno`判断错误类型。
+
+
+
+这里的主函数异常的简洁：
+
+```c++
+int main(int argc, char *argv[]) {
+    sylar::EnvMgr::GetInstance()->init(argc, argv);
+    sylar::Config::LoadFromConfDir(sylar::EnvMgr::GetInstance()->getConfigPath());
+    
+    test_iomanager();
+
+    return 0;
+}
+```
+
+除了处理命令行，读入配置文件，就是对类IOManager的处理，即test_iomanager()函数。
+
+```c++
+void test_iomanager() {
+    sylar::IOManager iom;
+    // sylar::IOManager iom(10); // 演示多线程下IO协程在不同线程之间切换
+    iom.schedule(test_io);
+}
+```
+
+首先是对IOManager的初始化：
+
+```c++
+IOManager::IOManager(size_t threads, bool use_caller, const std::string &name)
+    : Scheduler(threads, use_caller, name) {
+    m_epfd = epoll_create(5000); // 创建一个epollfd
+    SYLAR_ASSERT(m_epfd > 0);// 成功时，这些系统调用将返回非负文件描述符。如果出错，则返回-1，并且将errno设置为指示错误。
+
+    int rt = pipe(m_tickleFds);// 创建管道，用于进程间通信
+    SYLAR_ASSERT(!rt);// 成功返回0，失败返回-1，并且设置errno。
+
+    // 关注pipe读句柄的可读事件，用于tickle协程
+    epoll_event event;
+    memset(&event, 0, sizeof(epoll_event));// 用0初始化event
+    event.events  = EPOLLIN | EPOLLET;// 注册读事件，设置边缘触发模式
+    event.data.fd = m_tickleFds[0];// fd关联pipe的读端
+    // 对一个打开的文件描述符执行一系列控制操作
+    // 非阻塞方式，配合边缘触发，F_SETFL: 获取/设置文件状态标志，O_NONBLOCK: 使I/O变成非阻塞模式，在读取不到数据或是写入缓冲区已满会马上return，而不会阻塞等待。
+    rt = fcntl(m_tickleFds[0], F_SETFL, O_NONBLOCK);
+    SYLAR_ASSERT(!rt);
+    // 将pipe的读端注册到epoll
+    rt = epoll_ctl(m_epfd, EPOLL_CTL_ADD, m_tickleFds[0], &event);
+    SYLAR_ASSERT(!rt);
+    // 初始化socket事件上下文vector
+    contextResize(32);
+
+    start();
+}
+```
+
+首先类IOManager继承了类Scheduler，所以首先要初始化一下类scheduler，然后再初始化IOManager。初始化类scheduler这里就不介绍了。
+
+这里创建了两个东西，一个是m_epfd，这个是epollfd，m_epfd这个值实际上为句柄。就像上面学习的，即是打开文件，是从3开始标号，查看发现，这里的句柄值恰好为3。
+
+![image-20240702174657366](C:\Users\Linyuan\AppData\Roaming\Typora\typora-user-images\image-20240702174657366.png)
+
+然后是创建了管道。就像之前学习的，管道有一个读端，有一个写端。返回值为0，表示成功建立管道。同样的m_tickleFds中也是两位句柄，查看后发现分别为4和5。
+
+![image-20240702175905379](C:\Users\Linyuan\AppData\Roaming\Typora\typora-user-images\image-20240702175905379.png)
+
+之后建立了一个epoll_event结构的变量event。
+
+```c++
+typedef union epoll_data
+{
+  void *ptr;
+  int fd;
+  uint32_t u32;
+  uint64_t u64;
+} epoll_data_t;
+
+struct epoll_event
+{
+  uint32_t events;	/* Epoll events */
+  epoll_data_t data;	/* User data variable */
+} __EPOLL_PACKED;
+```
+
+进行注册：
+
+```c++
+event.events  = EPOLLIN | EPOLLET;// 注册读事件，设置边缘触发模式
+event.data.fd = m_tickleFds[0];// fd关联pipe的读端
+```
+
+可以看到event用于处理读事件。
+
+关于边缘触发模式，与之对应的是水平触发模式。
+
+> 在水平触发模式下，应用程序需要持续处理就绪的文件描述符，直到文件描述符上不再有数据可读为止。 相比之下，在边缘触发模式下，应用程序只会在状态变化时收到通知，而不会持续收到通知直到处理完数据。
+
+简而言之，边缘触发模式关注的一瞬间的变化，水平触发模式持续关注。
+
+另外关于events的值，其实相当于每一位表示一个注册值，如果这个值为1，说明对应的这一位注册了。
+
+![image-20240702175958436](C:\Users\Linyuan\AppData\Roaming\Typora\typora-user-images\image-20240702175958436.png)
+
+关联之后的events值，其中2147483649为2^31+1，即对应第0位和第31位。data中fd值变为4。不过data里面其他值也变为了4，感觉是同步变化的这样。
+
+之后就是将pipe的读端注册到epoll上。
+
+目前来看其实就三个结构玩来玩去，m_epfd，m_tickleFds，event。
+
+之后就是schedule操作了。
+
+```c++
+iom.schedule(test_io);
+
+template <class FiberOrCb>
+    void schedule(FiberOrCb fc, int thread = -1) {
+        bool need_tickle = false;
+        {
+            MutexType::Lock lock(m_mutex);
+            need_tickle = scheduleNoLock(fc, thread);
+        }
+
+        if (need_tickle) {
+            tickle(); // 唤醒idle协程（进行输出打印）
+        }
+    }
+```
+
+这个其实也没有操作什么，就是添加了一个task任务。
+
+所以其实主要是析构函数的操作hh。
+
+```c++
+IOManager::~IOManager() {
+    stop();// 停止调度器
+    close(m_epfd);// 释放epoll
+    close(m_tickleFds[0]);// 释放pipe
+    close(m_tickleFds[1]);
+
+    for (size_t i = 0; i < m_fdContexts.size(); ++i) {// 释放 m_fdContexts 内存
+        if (m_fdContexts[i]) {
+            delete m_fdContexts[i];
+        }
+    }
+}
+```
+
+首先是stop函数停止调度器，这个之前见过hh。主体就是进行resume=>MainFunc=>run。
+
+这里就不展开说了。
+
+最后落到函数`test_io`。

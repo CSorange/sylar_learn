@@ -4,7 +4,7 @@
 
 1. 只让当前线程运行：`set scheduler-locking on`；于此对应的有
 
-只让当前线程运行：`set scheduler-locking off`。
+不只让当前线程运行：`set scheduler-locking off`。
 
 2. 切换线程：thread x。这个自己可以多用，之前没有用过。
 

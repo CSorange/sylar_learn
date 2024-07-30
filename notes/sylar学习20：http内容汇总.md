@@ -32,7 +32,7 @@ void test_http_response() {
 
 在应答函数检测中，使用若干set函数之后用dump进行序列化输出。
 
-```
+```c++
 void test_http_request() {
     sylar::http::HttpRequest req;
     req.setMethod(sylar::http::HttpMethod::GET);
